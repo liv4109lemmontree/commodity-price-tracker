@@ -192,20 +192,25 @@ SUBDOMAIN_MAP = {
 }
 
 # ========== 抓取函数（包含网络重试） ==========
-def fetch_category_pages(category, target_names, start_page=1, max_pages=1100):
+def fetch_category_pages(category, target_names, start_page=1, max_pages=1100, incremental=False):
     """
     抓取指定品类的所有页面，包含网络重试机制
-    每页加载失败时会自动重试最多3次，跳过无法加载的页面
-    【价格提取优化】直接在整个 <li> 文本中搜索 "商品名为价格"，兼容各种标签结构
+    :param category: 品类名（如 '农副', '化工'）
+    :param target_names: 该品类下需要抓取的商品名列表（已弃用，但保留接口）
+    :param start_page: 起始页码
+    :param max_pages: 最大页码
+    :param incremental: 是否增量模式（True: 只抓取包含当天日期的页面）
     """
     sub = SUBDOMAIN_MAP.get(category, "agr")
     base_url = f"https://{sub}.100ppi.com/kx/list---{{}}.html"
     latest_prices = {}
     page = start_page
     empty_page_count = 0      # 连续无 <li> 标签页计数
-    empty_data_page_count = 0 # 连续有 <li> 但无有效数据页计数
+    today = datetime.now().date().isoformat()  # 当天日期
 
     print(f"\n===== 开始抓取 {category} 品类 (子域名: {sub}) =====")
+    if incremental:
+        print(f"增量模式：只抓取 {today} 的数据")
     print("正在启动无头浏览器获取数据...")
     chrome_options = Options()
     chrome_options.add_argument("--headless")
@@ -264,6 +269,7 @@ def fetch_category_pages(category, target_names, start_page=1, max_pages=1100):
 
             page_stored = 0
             page_products = set()
+            page_has_today = False  # 增量模式用：记录本页是否有当天数据
 
             for li in items:
                 # 1. 提取日期
@@ -275,6 +281,10 @@ def fetch_category_pages(category, target_names, start_page=1, max_pages=1100):
                 if not date_match:
                     continue
                 date_str = date_match.group(1)
+
+                # 增量模式：检查是否是当天数据
+                if incremental and date_str == today:
+                    page_has_today = True
 
                 # 2. 提取商品名
                 a_tag = li.find('a')
@@ -298,7 +308,7 @@ def fetch_category_pages(category, target_names, start_page=1, max_pages=1100):
                 if clean_name.endswith('参考价'):
                     clean_name = clean_name[:-3]
 
-                # 6. 直接存储所有商品
+                # 6. 存储所有商品（去重由 store_price 处理）
                 store_price(clean_name, price, date_str, category)
                 page_stored += 1
                 page_products.add(clean_name)
@@ -307,13 +317,13 @@ def fetch_category_pages(category, target_names, start_page=1, max_pages=1100):
             if page_stored > 0:
                 print(f"本页存储了 {page_stored} 条历史价格记录")
                 print(f"本页商品: {list(page_products)}")
-                empty_data_page_count = 0
             else:
                 print("本页无有效商品可存储")
-                empty_data_page_count += 1
-                if empty_data_page_count >= 2:
-                    print("已到达最后一页（连续两页有<li>但无有效数据），停止翻页")
-                    break
+
+            # 增量模式判断：如果本页没有当天数据，立即停止翻页
+            if incremental and not page_has_today:
+                print(f"第 {page} 页没有当天数据，停止翻页")
+                break
 
             page += 1
             if page > max_pages:
@@ -361,10 +371,10 @@ def store_price(name, price, price_date=None, category=None):
         print(f"存储过程中发生错误: {name}, 错误: {e}")
 
 if __name__ == "__main__":
-    print("开始执行数据抓取任务（分页全量抓取，逐页存储历史数据）...")
+    print("开始执行数据抓取任务（增量模式，只抓取当天数据）...")
 
-    # 模式选择：True 为全量抓取历史，False 为增量（只抓当天）
-    FULL_MODE = True
+    # 模式选择：False 为增量模式（只抓包含当天日期的页面）
+    FULL_MODE = False
 
     # 按品类分组商品
     categories_dict = {}
@@ -374,26 +384,34 @@ if __name__ == "__main__":
             categories_dict[cat] = []
         categories_dict[cat].append(item["page_name"])
 
-    # 只抓取化工品类（临时跳过农副）
+    # 循环处理所有品类（农副、化工等）
     for cat, target_names in categories_dict.items():
-        if cat != "化工":
-            print(f"\n跳过 {cat} 品类（当前只抓取化工）")
-            continue
-
         print(f"\n{'='*50}")
         print(f"准备处理品类: {cat}")
         print(f"包含商品数: {len(target_names)}")
 
         if FULL_MODE:
-            # 化工从第1页开始全量抓取
+            # 全量模式（历史抓取）：从第1页开始，最多1100页
             start_page = 1
             max_pages = 1100
+            incremental = False
         else:
+            # 增量模式：从第1页开始，但会在内部根据日期自动停止
             start_page = 1
-            max_pages = 1
+            max_pages = 50   # 农副最多2页，化工最多35页，50足够安全
+            incremental = True
 
-        latest = fetch_category_pages(cat, target_names, start_page=start_page, max_pages=max_pages)
+        latest = fetch_category_pages(
+            category=cat,
+            target_names=target_names,
+            start_page=start_page,
+            max_pages=max_pages,
+            incremental=incremental
+        )
+
         if latest:
-            print(f"{cat} 品类最新价格汇总: {latest}")
+            print(f"{cat} 品类当天抓取的商品数: {len(latest)}")
+        else:
+            print(f"{cat} 品类当天无新数据")
 
     print("\n所有品类抓取任务完成！")
